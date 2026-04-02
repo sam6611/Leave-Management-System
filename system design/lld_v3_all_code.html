@@ -1,0 +1,356 @@
+
+<div style="font-family:var(--font-sans);display:flex;flex-direction:column;gap:12px;padding:4px 0">
+
+<!-- rule_engine.py -->
+<div style="border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden">
+<div style="background:var(--color-background-secondary);padding:8px 14px;border-bottom:0.5px solid var(--color-border-tertiary);font-size:11px;font-weight:500;color:var(--color-text-tertiary);letter-spacing:.06em">services/rule_engine.py — 3 verdicts: REJECTED · APPROVED · UNCERTAIN</div>
+<pre style="margin:0;padding:12px 14px;font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);line-height:1.7">async def run_rules(leave, user, balance, db) -> dict:
+    lt = await db.fetchrow(
+        "SELECT * FROM leave_types WHERE id=$1",
+        leave["leave_type_id"]
+    )
+    max_days = (lt["max_days_student"]
+                if user["role"] == "STUDENT"
+                else lt["max_days_faculty"])
+
+    # CASE 1 — clear rejection (rule engine decides instantly)
+    if leave["total_days"] > max_days:
+        return {
+            "verdict": "REJECTED",
+            "reason": f"Cannot apply more than {max_days} days at once"
+        }
+
+    if balance["remaining_days"] < leave["total_days"]:
+        return {
+            "verdict": "REJECTED",
+            "reason": f"Only {balance['remaining_days']} days balance left"
+        }
+
+    clash = await db.fetchrow("""
+        SELECT id FROM leave_requests
+        WHERE applicant_id = $1
+          AND status = 'APPROVED'
+          AND start_date <= $3
+          AND end_date   >= $2
+    """, user["id"], leave["start_date"], leave["end_date"])
+
+    if clash:
+        return {
+            "verdict": "REJECTED",
+            "reason": "Already have approved leave on those dates"
+        }
+
+    # CASE 2 — clear approval (short leave, no need for AI)
+    if leave["total_days"] <= 2:
+        return {
+            "verdict": "APPROVED",
+            "reason": "Short leave auto-approved by system"
+        }
+
+    # CASE 3 — complex, send to AI
+    return {"verdict": "UNCERTAIN"}</pre>
+</div>
+
+<!-- automation.py -->
+<div style="border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden">
+<div style="background:var(--color-background-secondary);padding:8px 14px;border-bottom:0.5px solid var(--color-border-tertiary);font-size:11px;font-weight:500;color:var(--color-text-tertiary);letter-spacing:.06em">services/automation.py — split into 2 functions</div>
+<pre style="margin:0;padding:12px 14px;font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);line-height:1.7">from .rule_engine import run_rules
+from .ai_service  import ask_ai
+
+# ── FUNCTION 1 ── called in same request, returns instantly
+async def process_leave_rules_only(leave_id: str, db) -> dict:
+    leave, user, balance = await _fetch_all(leave_id, db)
+    rule = await run_rules(leave, user, balance, db)
+
+    if rule["verdict"] == "REJECTED":
+        await _save_decision(
+            db, leave_id, "REJECTED", "RULE_ENGINE", rule["reason"]
+        )
+        return {"status": "REJECTED",
+                "decided_by": "RULE_ENGINE",
+                "reason": rule["reason"]}
+
+    elif rule["verdict"] == "APPROVED":
+        await _save_decision(
+            db, leave_id, "APPROVED", "RULE_ENGINE", rule["reason"]
+        )
+        return {"status": "APPROVED",
+                "decided_by": "RULE_ENGINE",
+                "reason": rule["reason"]}
+
+    # UNCERTAIN — caller will add to background task
+    # mark as PROCESSING so frontend knows to poll
+    await db.execute("""
+        UPDATE leave_requests SET status='PROCESSING' WHERE id=$1
+    """, leave_id)
+    return {"status": "UNCERTAIN"}
+
+
+# ── FUNCTION 2 ── runs in background AFTER response sent
+async def process_leave_ai(leave_id: str):
+    # needs its own DB connection — background task has no request context
+    async with get_db_connection() as db:
+        leave, user, balance = await _fetch_all(leave_id, db)
+        ai = await ask_ai(leave, user, balance)
+        await _save_decision(db, leave_id, ai["decision"], "AI", ai["reason"])
+
+
+# ── shared helpers ──────────────────────────────────────
+
+async def _fetch_all(leave_id, db):
+    leave = await db.fetchrow(
+        "SELECT * FROM leave_requests WHERE id=$1", leave_id
+    )
+    user = await db.fetchrow(
+        "SELECT * FROM users WHERE id=$1", leave["applicant_id"]
+    )
+    balance = await db.fetchrow("""
+        SELECT * FROM leave_balance
+        WHERE user_id=$1 AND year=EXTRACT(YEAR FROM NOW())
+    """, user["id"])
+    return leave, user, balance
+
+
+async def _save_decision(db, leave_id, status, decided_by, reason):
+    async with db.transaction():
+        await db.execute("""
+            UPDATE leave_requests
+            SET status=$1, decided_by=$2,
+                decision_reason=$3, decided_at=NOW()
+            WHERE id=$4
+        """, status, decided_by, reason, leave_id)
+
+        await db.execute("""
+            INSERT INTO automation_log
+              (leave_id, final_decision, decided_by, ai_reason)
+            VALUES ($1, $2, $3, $4)
+        """, leave_id, status, decided_by, reason)
+
+        if status == "APPROVED":
+            leave = await db.fetchrow(
+                "SELECT * FROM leave_requests WHERE id=$1", leave_id
+            )
+            await db.execute("""
+                UPDATE leave_balance
+                SET used_days      = used_days + $1,
+                    remaining_days = remaining_days - $1
+                WHERE user_id=$2
+                  AND year=EXTRACT(YEAR FROM NOW())
+            """, leave["total_days"], leave["applicant_id"])</pre>
+</div>
+
+<!-- leaves.py router -->
+<div style="border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden">
+<div style="background:var(--color-background-secondary);padding:8px 14px;border-bottom:0.5px solid var(--color-border-tertiary);font-size:11px;font-weight:500;color:var(--color-text-tertiary);letter-spacing:.06em">routers/leaves.py — BackgroundTasks added</div>
+<pre style="margin:0;padding:12px 14px;font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);line-height:1.7">from fastapi import APIRouter, Depends, BackgroundTasks
+from app.services.automation import (
+    process_leave_rules_only,
+    process_leave_ai
+)
+from app.core.deps import require_role, get_db
+
+router = APIRouter(prefix="/api/leaves", tags=["leaves"])
+
+
+@router.post("/")
+async def apply_leave(
+    body:             LeaveCreate,
+    background_tasks: BackgroundTasks,
+    user =            Depends(require_role("STUDENT", "FACULTY")),
+    db   =            Depends(get_db)
+):
+    # step 1 — save to DB, status starts as PENDING
+    leave_id = await db.fetchval("""
+        INSERT INTO leave_requests
+          (applicant_id, leave_type_id, start_date,
+           end_date, total_days, reason, status)
+        VALUES ($1,$2,$3,$4,$5,$6,'PENDING')
+        RETURNING id
+    """, user["user_id"], body.leave_type_id,
+         body.start_date, body.end_date,
+         (body.end_date - body.start_date).days + 1,
+         body.reason)
+
+    # step 2 — run rule engine (fast, same request)
+    result = await process_leave_rules_only(leave_id, db)
+
+    # step 3 — if uncertain, hand off to background AI task
+    if result["status"] == "UNCERTAIN":
+        background_tasks.add_task(process_leave_ai, leave_id)
+        return {
+            "id":     leave_id,
+            "status": "PROCESSING",
+            "message": "Leave is being reviewed, check back shortly"
+        }
+
+    # step 4 — instant decision, return straight away
+    return {
+        "id":          leave_id,
+        "status":      result["status"],
+        "decided_by":  result["decided_by"],
+        "reason":      result["reason"]
+    }
+
+
+@router.get("/{leave_id}")
+async def get_leave_status(
+    leave_id: str,
+    user = Depends(require_role("STUDENT", "FACULTY")),
+    db   = Depends(get_db)
+):
+    """Frontend polls this every 2s when status is PROCESSING"""
+    row = await db.fetchrow(
+        "SELECT * FROM leave_requests WHERE id=$1 AND applicant_id=$2",
+        leave_id, user["user_id"]
+    )
+    if not row:
+        raise HTTPException(404, "Leave not found")
+    return row
+
+
+@router.get("/my")
+async def my_leaves(
+    user = Depends(require_role("STUDENT", "FACULTY")),
+    db   = Depends(get_db)
+):
+    return await db.fetch("""
+        SELECT lr.*, lt.name as leave_type_name
+        FROM leave_requests lr
+        JOIN leave_types lt ON lt.id = lr.leave_type_id
+        WHERE lr.applicant_id = $1
+        ORDER BY lr.created_at DESC
+    """, user["user_id"])
+
+
+@router.get("/balance")
+async def my_balance(
+    user = Depends(require_role("STUDENT", "FACULTY")),
+    db   = Depends(get_db)
+):
+    return await db.fetchrow("""
+        SELECT entitled_days, used_days, remaining_days
+        FROM leave_balance
+        WHERE user_id=$1 AND year=EXTRACT(YEAR FROM NOW())
+    """, user["user_id"])</pre>
+</div>
+
+<!-- admin override -->
+<div style="border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden">
+<div style="background:var(--color-background-secondary);padding:8px 14px;border-bottom:0.5px solid var(--color-border-tertiary);font-size:11px;font-weight:500;color:var(--color-text-tertiary);letter-spacing:.06em">routers/admin.py — override endpoint (only way a human changes a decision)</div>
+<pre style="margin:0;padding:12px 14px;font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);line-height:1.7">@router.put("/leaves/{leave_id}/override")
+async def override_leave(
+    leave_id: str,
+    body: OverrideRequest,    # { new_status, override_reason }
+    admin = Depends(require_role("ADMIN")),
+    db    = Depends(get_db)
+):
+    old = await db.fetchrow(
+        "SELECT status FROM leave_requests WHERE id=$1", leave_id
+    )
+    if not old:
+        raise HTTPException(404, "Leave not found")
+
+    async with db.transaction():
+        await db.execute("""
+            UPDATE leave_requests
+            SET status=$1, decided_by='ADMIN',
+                decision_reason=$2, decided_at=NOW()
+            WHERE id=$3
+        """, body.new_status, body.override_reason, leave_id)
+
+        await db.execute("""
+            INSERT INTO admin_overrides
+              (leave_id, admin_id, prev_status, new_status, override_reason)
+            VALUES ($1,$2,$3,$4,$5)
+        """, leave_id, admin["user_id"],
+             old["status"], body.new_status, body.override_reason)
+
+    return {"message": "Override done", "new_status": body.new_status}</pre>
+</div>
+
+<!-- ai_service.py -->
+<div style="border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden">
+<div style="background:var(--color-background-secondary);padding:8px 14px;border-bottom:0.5px solid var(--color-border-tertiary);font-size:11px;font-weight:500;color:var(--color-text-tertiary);letter-spacing:.06em">services/ai_service.py — unchanged logic, only called for UNCERTAIN cases</div>
+<pre style="margin:0;padding:12px 14px;font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);line-height:1.7">import anthropic, json
+client = anthropic.Anthropic()
+
+async def ask_ai(leave, user, balance) -> dict:
+    prompt = f"""You are an automated leave approval system for a college.
+Decide whether to APPROVE or REJECT this leave request.
+
+Role     : {user['role']}
+Type     : {leave['leave_type_name']}
+Days     : {leave['total_days']}  ({leave['start_date']} to {leave['end_date']})
+Reason   : "{leave['reason']}"
+Used this year    : {balance['used_days']} days
+Balance remaining : {balance['remaining_days']} days
+
+Basic checks (max days, balance, date clash) already passed.
+Decide based on whether the reason is genuine and reasonable.
+
+Reply ONLY in JSON, no extra text:
+{{"decision": "APPROVED" or "REJECTED", "reason": "one sentence"}}"""
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=80,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return json.loads(msg.content[0].text)</pre>
+</div>
+
+<!-- frontend polling -->
+<div style="border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden">
+<div style="background:var(--color-background-secondary);padding:8px 14px;border-bottom:0.5px solid var(--color-border-tertiary);font-size:11px;font-weight:500;color:var(--color-text-tertiary);letter-spacing:.06em">React — polling hook when status is PROCESSING</div>
+<pre style="margin:0;padding:12px 14px;font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);line-height:1.7">import { useEffect, useState } from "react"
+import axios from "./api/axios"
+
+function useLeaveStatus(leaveId, initialStatus) {
+  const [status, setStatus]   = useState(initialStatus)
+  const [reason, setReason]   = useState("")
+  const [polling, setPolling] = useState(initialStatus === "PROCESSING")
+
+  useEffect(() => {
+    if (!polling) return
+
+    const interval = setInterval(async () => {
+      const res = await axios.get(`/api/leaves/${leaveId}`)
+      const { status: s, decision_reason } = res.data
+
+      if (s !== "PROCESSING") {
+        setStatus(s)
+        setReason(decision_reason)
+        setPolling(false)   // stop polling once final
+        clearInterval(interval)
+      }
+    }, 2000)   // every 2 seconds
+
+    return () => clearInterval(interval)
+  }, [leaveId, polling])
+
+  return { status, reason, polling }
+}
+
+// usage in ApplyLeave.jsx
+function ApplyLeave() {
+  const [leaveId, setLeaveId] = useState(null)
+  const [initStatus, setInitStatus] = useState(null)
+
+  const handleSubmit = async (formData) => {
+    const res = await axios.post("/api/leaves", formData)
+    setLeaveId(res.data.id)
+    setInitStatus(res.data.status)
+  }
+
+  const { status, reason, polling } = useLeaveStatus(leaveId, initStatus)
+
+  return (
+    &lt;div&gt;
+      {polling   &amp;&amp; &lt;p&gt;Processing your leave request...&lt;/p&gt;}
+      {!polling  &amp;&amp; &lt;StatusBadge status={status} reason={reason} /&gt;}
+    &lt;/div&gt;
+  )
+}</pre>
+</div>
+
+</div>
