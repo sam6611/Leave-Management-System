@@ -1,0 +1,483 @@
+
+<h2 class="sr-only">Automated Leave Approval System — Full Design Reference</h2>
+<style>
+body{margin:0;padding:0}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;padding:1rem 0 0.75rem;border-bottom:0.5px solid var(--color-border-tertiary);margin-bottom:1.25rem}
+.tab{padding:5px 14px;border-radius:var(--border-radius-md);border:0.5px solid var(--color-border-secondary);font-size:13px;cursor:pointer;background:transparent;color:var(--color-text-secondary);transition:all .15s}
+.tab.active{background:var(--color-background-info);color:var(--color-text-info);border-color:var(--color-border-info)}
+.pane{display:none}.pane.active{display:block}
+h3{font-size:16px;font-weight:500;margin:1.25rem 0 0.5rem;color:var(--color-text-primary)}
+h4{font-size:14px;font-weight:500;margin:1rem 0 0.4rem;color:var(--color-text-primary)}
+p,li{font-size:14px;line-height:1.7;color:var(--color-text-secondary);margin:0 0 0.5rem}
+ul{padding-left:1.2rem;margin:0 0 0.75rem}
+code{font-family:var(--font-mono);font-size:12px;background:var(--color-background-secondary);padding:1px 5px;border-radius:4px;color:var(--color-text-primary)}
+pre{font-family:var(--font-mono);font-size:12px;background:var(--color-background-secondary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-md);padding:12px;overflow-x:auto;line-height:1.6;margin:0.5rem 0 1rem}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:var(--border-radius-md);font-weight:500;margin-right:4px}
+.badge-green{background:var(--color-background-success);color:var(--color-text-success)}
+.badge-amber{background:var(--color-background-warning);color:var(--color-text-warning)}
+.badge-red{background:var(--color-background-danger);color:var(--color-text-danger)}
+.badge-blue{background:var(--color-background-info);color:var(--color-text-info)}
+.card{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:12px 16px;margin:0.5rem 0 1rem;border:0.5px solid var(--color-border-tertiary)}
+.flow-step{display:flex;gap:12px;margin:0.5rem 0;align-items:flex-start}
+.step-num{min-width:24px;height:24px;border-radius:50%;background:var(--color-background-info);color:var(--color-text-info);font-size:12px;font-weight:500;display:flex;align-items:center;justify-content:center}
+.step-body{font-size:14px;line-height:1.6;color:var(--color-text-secondary)}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;font-size:13px;margin:0.5rem 0}
+.kv .k{color:var(--color-text-secondary);font-weight:500}
+.kv .v{color:var(--color-text-primary)}
+.alert-row{display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:0.5px solid var(--color-border-tertiary);font-size:13px}
+.alert-row:last-child{border-bottom:none}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:0.5rem 0 1rem}
+th{text-align:left;font-weight:500;font-size:12px;color:var(--color-text-secondary);padding:6px 8px;border-bottom:0.5px solid var(--color-border-tertiary)}
+td{padding:7px 8px;border-bottom:0.5px solid var(--color-border-tertiary);color:var(--color-text-primary)}
+tr:last-child td{border-bottom:none}
+.scale-tier{border-left:2px solid var(--color-border-info);padding:8px 0 8px 12px;margin:0.5rem 0 1rem}
+</style>
+
+<div class="tabs">
+  <button class="tab active" onclick="show('flow')">Data flow</button>
+  <button class="tab" onclick="show('db')">Database</button>
+  <button class="tab" onclick="show('redis')">Redis design</button>
+  <button class="tab" onclick="show('worker')">Worker</button>
+  <button class="tab" onclick="show('rules')">Rule engine</button>
+  <button class="tab" onclick="show('cache')">Cache strategy</button>
+  <button class="tab" onclick="show('metrics')">Metrics &amp; alerts</button>
+  <button class="tab" onclick="show('scale')">Scaling</button>
+  <button class="tab" onclick="show('tradeoffs')">Tradeoffs</button>
+</div>
+
+<!-- DATA FLOW -->
+<div id="pane-flow" class="pane active">
+<h3>Request lifecycle — step by step</h3>
+
+<div class="flow-step"><div class="step-num">1</div><div class="step-body"><strong>Client → NGINX.</strong> Request hits NGINX. Rate limiter checks IP bucket (<code>100 req/min</code>). Exceeds limit → <code>429</code>. Passes → routed to least-loaded FastAPI instance via upstream pool. SSL terminated here.</div></div>
+
+<div class="flow-step"><div class="step-num">2</div><div class="step-body"><strong>NGINX → FastAPI.</strong> FastAPI receives <code>POST /leave/apply</code>. Request is stateless — any instance can handle it.</div></div>
+
+<div class="flow-step"><div class="step-num">3</div><div class="step-body"><strong>Auth check.</strong> JWT token validated (signature + expiry). Role extracted (<code>student | faculty | admin</code>). Unauthorized → <code>401</code>. Role mismatch for action → <code>403</code>.</div></div>
+
+<div class="flow-step"><div class="step-num">4</div><div class="step-body"><strong>Idempotency check.</strong> Compute key = <code>SHA256(user_id + leave_type + start_date + end_date)</code>. Check Redis: <code>GET idempotency:{key}</code>. If exists → return cached response immediately (duplicate suppressed). If absent → <code>SET idempotency:{key} "processing" EX 86400 NX</code> (atomic, 24h TTL).</div></div>
+
+<div class="flow-step"><div class="step-num">5</div><div class="step-body"><strong>Persist PENDING.</strong> Insert row in <code>leave_requests</code> with <code>status = PENDING</code>. Write audit log entry: <code>system → PENDING</code>. Commit transaction. Now durable — even if the process crashes, request is recoverable.</div></div>
+
+<div class="flow-step"><div class="step-num">6</div><div class="step-body"><strong>Rule engine evaluation.</strong> Rules loaded from Redis cache (TTL 5 min, backed by DB). Engine evaluates sequentially by priority. Three outcomes:
+  <br><span class="badge badge-green">APPROVED</span> → update DB, write audit log, enqueue notification, return <code>200 {status: "APPROVED"}</code> (<code>&lt;200ms</code>)
+  <br><span class="badge badge-red">REJECTED</span> → update DB, write audit log, enqueue notification, return <code>200 {status: "REJECTED"}</code> (<code>&lt;200ms</code>)
+  <br><span class="badge badge-amber">UNCERTAIN</span> → push job to Redis queue, update idempotency key to request_id, return <code>202 {status: "PROCESSING", request_id}</code>
+</div></div>
+
+<div class="flow-step"><div class="step-num">7</div><div class="step-body"><strong>AI worker (async).</strong> Worker pops job from Redis queue. Builds context prompt. Calls AI model API. Receives APPROVED/REJECTED decision with reasoning. Updates DB. Writes audit log. Enqueues notification. Updates idempotency key with final result.</div></div>
+
+<div class="flow-step"><div class="step-num">8</div><div class="step-body"><strong>Notification service.</strong> Separate worker consumes notification queue. Sends email/push asynchronously. Retries on failure. Never blocks the main request path.</div></div>
+
+<div class="flow-step"><div class="step-num">9</div><div class="step-body"><strong>Frontend polling.</strong> Client polls <code>GET /leave/status/{request_id}</code> every 3s (max 5 attempts). Response served from Redis cache first. If cache miss, reads DB and repopulates cache. Admin can override at any point via <code>PATCH /leave/{id}/override</code>.</div></div>
+</div>
+
+<!-- DATABASE -->
+<div id="pane-db" class="pane">
+<h3>Schema design</h3>
+
+<pre>-- Users
+CREATE TABLE users (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name        TEXT NOT NULL,
+  email       TEXT UNIQUE NOT NULL,
+  role        TEXT CHECK (role IN ('student','faculty','admin')),
+  department  TEXT,
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- Leave requests
+CREATE TABLE leave_requests (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID NOT NULL REFERENCES users(id),
+  leave_type      TEXT NOT NULL,  -- 'medical', 'casual', 'exam', etc.
+  start_date      DATE NOT NULL,
+  end_date        DATE NOT NULL,
+  days_requested  INT GENERATED ALWAYS AS (end_date - start_date + 1) STORED,
+  reason          TEXT,
+  status          TEXT DEFAULT 'PENDING'
+                  CHECK (status IN ('PENDING','APPROVED','REJECTED','PROCESSING')),
+  decision_source TEXT CHECK (decision_source IN ('rule_engine','ai','admin')),
+  ai_reasoning    TEXT,
+  idempotency_key TEXT UNIQUE,
+  created_at      TIMESTAMPTZ DEFAULT now(),
+  updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- Audit log (append-only)
+CREATE TABLE audit_logs (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type  TEXT NOT NULL,         -- 'leave_request'
+  entity_id    UUID NOT NULL,
+  actor_id     UUID REFERENCES users(id),
+  actor_type   TEXT,                  -- 'system', 'rule_engine', 'ai', 'admin'
+  action       TEXT NOT NULL,         -- 'status_change', 'override'
+  prev_state   JSONB,
+  new_state    JSONB,
+  metadata     JSONB,                 -- rule matched, AI confidence, etc.
+  created_at   TIMESTAMPTZ DEFAULT now()
+);
+
+-- Configurable rules
+CREATE TABLE leave_rules (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  rule_key       TEXT UNIQUE NOT NULL, -- 'max_auto_approve_days'
+  rule_value     JSONB NOT NULL,       -- {"value": 3, "roles": ["student"]}
+  description    TEXT,
+  priority       INT DEFAULT 100,
+  is_active      BOOLEAN DEFAULT true,
+  updated_by     UUID REFERENCES users(id),
+  updated_at     TIMESTAMPTZ DEFAULT now()
+);
+
+-- Leave balance (per user per year)
+CREATE TABLE leave_balances (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES users(id),
+  leave_type  TEXT NOT NULL,
+  year        INT NOT NULL,
+  total       INT NOT NULL,
+  used        INT DEFAULT 0,
+  UNIQUE(user_id, leave_type, year)
+);</pre>
+
+<h4>Indexing strategy</h4>
+<table>
+<tr><th>Table</th><th>Index</th><th>Reason</th></tr>
+<tr><td><code>leave_requests</code></td><td><code>idx_lr_user_id</code> on <code>user_id</code></td><td>Fetch all leaves for a user</td></tr>
+<tr><td><code>leave_requests</code></td><td><code>idx_lr_status</code> on <code>status</code></td><td>Admin dashboard filter by status</td></tr>
+<tr><td><code>leave_requests</code></td><td><code>idx_lr_created_at</code> on <code>created_at DESC</code></td><td>Chronological listing, pagination</td></tr>
+<tr><td><code>leave_requests</code></td><td><code>idx_lr_user_date</code> on <code>(user_id, start_date, end_date)</code></td><td>Overlap detection query</td></tr>
+<tr><td><code>audit_logs</code></td><td><code>idx_al_entity</code> on <code>(entity_type, entity_id)</code></td><td>Fetch audit trail for a request</td></tr>
+<tr><td><code>leave_balances</code></td><td><code>idx_lb_user_year</code> on <code>(user_id, year)</code></td><td>Balance lookup during rule check</td></tr>
+<tr><td><code>users</code></td><td><code>idx_u_email</code> on <code>email</code> (UNIQUE)</td><td>Auth lookup</td></tr>
+</table>
+
+<h4>Admin pagination &amp; filtering</h4>
+<pre>-- Cursor-based pagination (preferred over OFFSET for large datasets)
+GET /admin/leaves?status=PENDING&department=CS&after_id=UUID&limit=20
+
+SELECT * FROM leave_requests lr
+JOIN users u ON u.id = lr.user_id
+WHERE lr.status = 'PENDING'
+  AND u.department = 'CS'
+  AND lr.id > :after_id      -- keyset pagination
+ORDER BY lr.id
+LIMIT 20;</pre>
+<p>Use keyset (cursor) pagination — <code>OFFSET</code> degrades at scale because the DB still scans skipped rows.</p>
+</div>
+
+<!-- REDIS DESIGN -->
+<div id="pane-redis" class="pane">
+<h3>Redis key namespaces</h3>
+<p>Three completely separate concerns — cache, queue, idempotency — each with distinct key patterns and TTLs.</p>
+
+<h4>1. Cache keys</h4>
+<pre>leave:status:{request_id}     → JSON {status, updated_at, ...}  TTL: 60s
+leave:balance:{user_id}:{year} → JSON {used, total}               TTL: 300s
+rules:active                  → JSON array of rule objects         TTL: 300s
+user:profile:{user_id}        → JSON {role, department}           TTL: 600s</pre>
+
+<h4>2. Queue keys (Redis List)</h4>
+<pre>queue:ai_jobs               → LPUSH to enqueue, BRPOP to consume (blocking pop)
+queue:notifications          → LPUSH to enqueue, BRPOP to consume
+queue:dlq:ai_jobs            → Dead letter queue — jobs exceeding max retries
+queue:dlq:notifications      → DLQ for failed notifications</pre>
+
+<p>Job payload structure:</p>
+<pre>{
+  "job_id":     "uuid",
+  "request_id": "uuid",
+  "user_id":    "uuid",
+  "leave_type": "medical",
+  "start_date": "2025-06-01",
+  "end_date":   "2025-06-05",
+  "reason":     "...",
+  "attempt":    1,
+  "enqueued_at": "ISO8601"
+}</pre>
+
+<h4>3. Idempotency keys</h4>
+<pre>idempotency:{sha256_key}    → "processing" | "{request_id}"    TTL: 86400s (24h)</pre>
+<p>Set with <code>NX</code> flag (only if not exists) — atomic, no race condition. First request wins. Duplicate requests within 24h get the original response.</p>
+
+<h4>4. Rate limiting keys (NGINX / application level)</h4>
+<pre>ratelimit:ip:{ip_address}    → counter                           TTL: 60s
+ratelimit:user:{user_id}     → counter                           TTL: 3600s</pre>
+</div>
+
+<!-- WORKER -->
+<div id="pane-worker" class="pane">
+<h3>AI worker design</h3>
+
+<h4>Worker loop (pseudocode)</h4>
+<pre>while True:
+    job = redis.BRPOP("queue:ai_jobs", timeout=5)
+    if not job:
+        continue
+
+    data = parse(job)
+
+    if data["attempt"] > MAX_RETRIES:  # MAX_RETRIES = 3
+        redis.LPUSH("queue:dlq:ai_jobs", job)
+        log_error("Job exceeded max retries", data["job_id"])
+        continue
+
+    try:
+        decision = call_ai_model(data)   # APPROVED | REJECTED + reasoning
+        update_db(data["request_id"], decision)
+        write_audit_log(data, decision, actor="ai")
+        update_cache(data["request_id"], decision)
+        update_idempotency(data["idempotency_key"], data["request_id"])
+        enqueue_notification(data, decision)
+
+    except AIServiceException as e:
+        delay = 2 ** data["attempt"]  # 2s, 4s, 8s
+        data["attempt"] += 1
+        data["retry_after"] = now() + delay
+        schedule_retry(data, delay)   # re-push after delay
+        log_warning("AI call failed, retry scheduled", delay=delay)
+
+    except Exception as e:
+        redis.LPUSH("queue:dlq:ai_jobs", job)
+        log_error("Unrecoverable error", e)</pre>
+
+<h4>Retry strategy</h4>
+<table>
+<tr><th>Attempt</th><th>Delay</th><th>Action</th></tr>
+<tr><td>1</td><td>2s</td><td>Retry</td></tr>
+<tr><td>2</td><td>4s</td><td>Retry</td></tr>
+<tr><td>3</td><td>8s</td><td>Retry</td></tr>
+<tr><td>4</td><td>—</td><td>Move to DLQ, alert on-call</td></tr>
+</table>
+
+<h4>DLQ processing</h4>
+<p>DLQ jobs are not lost — they sit in <code>queue:dlq:ai_jobs</code>. An ops engineer can inspect them via admin API, fix the root cause, and replay them: <code>BRPOP dlq → LPUSH queue:ai_jobs</code>. Alert fires when DLQ size exceeds threshold (see Metrics tab).</p>
+
+<h4>AI prompt construction</h4>
+<pre>system_prompt = """
+You are a leave approval system. Given a leave request, return a JSON decision:
+{"decision": "APPROVED" | "REJECTED", "reasoning": "...", "confidence": 0-1}
+Only return valid JSON.
+"""
+
+user_prompt = f"""
+User: {role}, {department}
+Leave: {leave_type}, {days} days ({start} to {end})
+Reason: {reason}
+Balance remaining: {balance} days
+Pending requests: {pending_count}
+Academic calendar context: {semester_info}
+"""</pre>
+
+<h4>Fallback if AI is unavailable</h4>
+<p>If AI service is down after all retries, the request stays <code>PROCESSING</code> and a manual review flag is set. Admin is notified. SLA: admin must review within 24h. This is preferable to auto-rejecting a legitimate request.</p>
+</div>
+
+<!-- RULE ENGINE -->
+<div id="pane-rules" class="pane">
+<h3>Configurable rule engine</h3>
+<p>Rules are stored in the <code>leave_rules</code> DB table and cached in Redis for 5 minutes. No hardcoding. Changes take effect within one cache TTL without a deploy.</p>
+
+<h4>Rule evaluation flow</h4>
+<pre>def evaluate(request, user, balance, rules) -> "APPROVED" | "REJECTED" | "UNCERTAIN":
+    # Sort rules by priority (lower number = higher priority)
+    for rule in sorted(rules, key=lambda r: r.priority):
+        if not rule.applies_to(user.role, request.leave_type):
+            continue
+
+        result = rule.evaluate(request, user, balance)
+        if result in ("APPROVED", "REJECTED"):
+            return result   # First decisive rule wins
+
+    return "UNCERTAIN"      # No rule was decisive → send to AI</pre>
+
+<h4>Example rules in DB</h4>
+<table>
+<tr><th>rule_key</th><th>rule_value</th><th>Effect</th></tr>
+<tr><td><code>max_auto_approve_days</code></td><td><code>{"student": 2, "faculty": 3}</code></td><td>≤N days → APPROVED automatically</td></tr>
+<tr><td><code>blackout_dates</code></td><td><code>{"dates": ["2025-12-20","2025-12-31"]}</code></td><td>Leave on these dates → REJECTED</td></tr>
+<tr><td><code>min_advance_days</code></td><td><code>{"value": 1}</code></td><td>Same-day request → REJECTED</td></tr>
+<tr><td><code>max_pending_requests</code></td><td><code>{"value": 2}</code></td><td>Already 2 pending → REJECTED</td></tr>
+<tr><td><code>balance_required</code></td><td><code>{"value": true}</code></td><td>No balance left → REJECTED</td></tr>
+<tr><td><code>overlap_check</code></td><td><code>{"value": true}</code></td><td>Overlaps approved leave → REJECTED</td></tr>
+<tr><td><code>medical_auto_approve_days</code></td><td><code>{"value": 7, "requires_doc": false}</code></td><td>Medical ≤7 days → APPROVED</td></tr>
+</table>
+
+<h4>UNCERTAIN triggers (sent to AI)</h4>
+<ul>
+<li>Days requested > max_auto_approve_days but not clearly invalid</li>
+<li>Reason mentions extenuating circumstances (e.g., bereavement)</li>
+<li>Conflicting rules (e.g., blackout date but medical leave)</li>
+<li>No rule matched at all — novel situation</li>
+</ul>
+</div>
+
+<!-- CACHE STRATEGY -->
+<div id="pane-cache" class="pane">
+<h3>Cache strategy</h3>
+
+<h4>What gets cached</h4>
+<table>
+<tr><th>Data</th><th>Key</th><th>TTL</th><th>Rationale</th></tr>
+<tr><td>Leave status</td><td><code>leave:status:{id}</code></td><td>60s</td><td>Polled frequently; short TTL keeps it fresh</td></tr>
+<tr><td>Leave balance</td><td><code>leave:balance:{uid}:{year}</code></td><td>300s</td><td>Changes only on approval/rejection</td></tr>
+<tr><td>Active rules</td><td><code>rules:active</code></td><td>300s</td><td>Rarely changes; warm cache avoids DB on every request</td></tr>
+<tr><td>User profile</td><td><code>user:profile:{uid}</code></td><td>600s</td><td>Role/dept used in every rule check</td></tr>
+<tr><td>Admin list view</td><td><code>admin:list:{hash}</code></td><td>30s</td><td>Short TTL — admin needs near-real-time data</td></tr>
+</table>
+
+<h4>Read strategy: cache-aside (lazy loading)</h4>
+<pre>def get_leave_status(request_id):
+    cached = redis.GET(f"leave:status:{request_id}")
+    if cached:
+        return parse(cached)          # cache hit
+
+    record = db.query(request_id)    # cache miss → read DB
+    redis.SETEX(f"leave:status:{request_id}", 60, serialize(record))
+    return record</pre>
+
+<h4>Cache invalidation</h4>
+<p>Invalidation happens immediately on any state change — never wait for TTL expiry when accuracy matters:</p>
+<pre>def update_leave_status(request_id, new_status):
+    db.update(request_id, status=new_status)         # 1. write DB first
+    redis.DELETE(f"leave:status:{request_id}")       # 2. invalidate cache
+    redis.SETEX(f"leave:status:{request_id}", 60,    # 3. repopulate
+                serialize(new_status))</pre>
+
+<p>Write-through (not write-back) — always write DB first. If Redis write fails, the DB is the source of truth. Cache staleness is bounded by TTL in the worst case.</p>
+
+<h4>Cache warming on startup</h4>
+<p>On worker/API startup, preload <code>rules:active</code> into Redis. Avoids cold-start latency spike when a new instance spins up during a traffic burst.</p>
+</div>
+
+<!-- METRICS -->
+<div id="pane-metrics" class="pane">
+<h3>Observability — metrics &amp; alerts</h3>
+
+<h4>Key metrics to track</h4>
+<table>
+<tr><th>Metric</th><th>Tool</th><th>Alert threshold</th></tr>
+<tr><td>p95 API latency (rule-based)</td><td>Prometheus histogram</td><td>&gt; 200ms → warning; &gt; 500ms → page</td></tr>
+<tr><td>p95 API latency (AI path)</td><td>Prometheus histogram</td><td>&gt; 30s → warning</td></tr>
+<tr><td>Queue depth: <code>queue:ai_jobs</code></td><td><code>LLEN</code> polled every 30s</td><td>&gt; 50 jobs → scale workers; &gt; 200 → page</td></tr>
+<tr><td>DLQ size: <code>queue:dlq:ai_jobs</code></td><td><code>LLEN</code> polled every 60s</td><td>&gt; 0 → alert immediately</td></tr>
+<tr><td>Error rate (5xx)</td><td>NGINX + app logs</td><td>&gt; 1% over 5m → warning; &gt; 5% → page</td></tr>
+<tr><td>Rule engine decision split</td><td>Counters per outcome</td><td>UNCERTAIN &gt; 50% → review rules</td></tr>
+<tr><td>AI model latency</td><td>Timing around AI call</td><td>&gt; 10s → consider timeout + fallback</td></tr>
+<tr><td>DB connection pool utilization</td><td>SQLAlchemy metrics</td><td>&gt; 80% → scale API instances</td></tr>
+<tr><td>Cache hit rate</td><td>Redis INFO + custom counters</td><td>&lt; 70% → review TTLs</td></tr>
+<tr><td>Redis memory usage</td><td>Redis INFO memory</td><td>&gt; 80% maxmemory → alert</td></tr>
+</table>
+
+<h4>Structured logging format</h4>
+<pre>{
+  "timestamp": "ISO8601",
+  "level": "INFO",
+  "request_id": "uuid",
+  "user_id": "uuid",
+  "action": "rule_engine_decision",
+  "outcome": "APPROVED",
+  "rule_matched": "max_auto_approve_days",
+  "latency_ms": 45,
+  "trace_id": "distributed-trace-id"
+}</pre>
+
+<h4>Distributed tracing</h4>
+<p>Inject <code>X-Trace-ID</code> header at NGINX. Propagate through FastAPI → worker → notifications. Every log line includes trace_id. Enables reconstructing the full journey of any leave request across async workers.</p>
+
+<h4>Alert runbook pointers</h4>
+<div class="card">
+<div class="alert-row"><span class="badge badge-red">DLQ &gt; 0</span><span>Check AI service status. Inspect DLQ job payloads. Replay after fix.</span></div>
+<div class="alert-row"><span class="badge badge-amber">Queue &gt; 50</span><span>Scale AI worker horizontally (add more worker processes on same or new machine).</span></div>
+<div class="alert-row"><span class="badge badge-red">p95 &gt; 500ms</span><span>Check DB slow query log. Check Redis latency. Check NGINX upstream pool.</span></div>
+<div class="alert-row"><span class="badge badge-amber">Error rate &gt; 1%</span><span>Check application logs. Check DB connectivity. Check AI API key validity.</span></div>
+</div>
+</div>
+
+<!-- SCALING -->
+<div id="pane-scale" class="pane">
+<h3>Scaling behavior</h3>
+
+<div class="scale-tier">
+<h4>1K users — single-node baseline</h4>
+<p>Single FastAPI instance, single PostgreSQL, single Redis. Rule engine handles ~95% of requests in &lt;50ms. No queue depth issues. One AI worker sufficient. Main concern: database connection pool sizing (set pool size = 20–30).</p>
+<p><strong>Bottleneck:</strong> None at this scale. Keep it simple.</p>
+</div>
+
+<div class="scale-tier">
+<h4>10K users — horizontal API scaling</h4>
+<p>Add 3–5 FastAPI instances behind NGINX (round-robin). Stateless design means no session affinity needed. Redis becomes critical — all instances share the same cache, idempotency store, and queues. Add PostgreSQL read replica for admin list queries (write to primary, read listings from replica). Add 2–3 AI workers. NGINX handles ~5K req/s easily.</p>
+<p><strong>Bottleneck:</strong> PostgreSQL write throughput (especially audit logs). Mitigate with connection pooling (PgBouncer) and batching audit writes.</p>
+</div>
+
+<div class="scale-tier">
+<h4>1M users — serious distributed system</h4>
+<p>At this scale, the architecture changes materially:</p>
+<ul>
+<li><strong>PostgreSQL:</strong> Partition <code>leave_requests</code> by <code>created_at</code> (monthly). Partition <code>audit_logs</code> separately. Add read replicas per region. Consider archiving old records to cold storage.</li>
+<li><strong>Redis:</strong> Redis Cluster with 3+ shards. Separate Redis instances for queue vs cache vs idempotency (different eviction policies).</li>
+<li><strong>Workers:</strong> Scale AI workers independently from API (they have different resource profiles — API is CPU-light, workers are I/O-heavy waiting on AI API).</li>
+<li><strong>API instances:</strong> 20–50 FastAPI processes. NGINX upstream pool auto-managed.</li>
+<li><strong>Queue:</strong> Redis lists still work at this scale, but consider migrating to a purpose-built queue (Celery with Redis backend, or eventually Kafka). This is when the "no Kafka" constraint starts to hurt.</li>
+<li><strong>CDN:</strong> Static assets and public-facing status pages behind CDN.</li>
+<li><strong>Rate limiting:</strong> Move from NGINX local state to Redis-backed rate limiting (distributed, consistent across instances).</li>
+</ul>
+<p><strong>Bottleneck:</strong> AI API rate limits (external dependency). Implement request coalescing, priority queuing (faculty requests before student?), and circuit breaker pattern on AI calls.</p>
+</div>
+
+<h4>Scaling decision tree</h4>
+<table>
+<tr><th>Signal</th><th>Action</th></tr>
+<tr><td>p95 latency rising</td><td>Add FastAPI instances</td></tr>
+<tr><td>Queue depth rising</td><td>Add AI workers</td></tr>
+<tr><td>DB CPU high</td><td>Add read replica, optimize queries, add PgBouncer</td></tr>
+<tr><td>Redis memory pressure</td><td>Reduce TTLs, add Redis shard, set eviction policy</td></tr>
+<tr><td>AI API throttled</td><td>Implement circuit breaker, add request coalescing</td></tr>
+</table>
+</div>
+
+<!-- TRADEOFFS -->
+<div id="pane-tradeoffs" class="pane">
+<h3>Design tradeoffs — interview-ready explanations</h3>
+
+<h4>Why Redis (not Kafka)?</h4>
+<div class="card">
+<p><strong>Chosen:</strong> Redis lists (<code>LPUSH</code>/<code>BRPOP</code>) for queuing.</p>
+<p><strong>Why:</strong> The constraint said no Kafka, but the reasoning is genuine: at &lt;10K users, Kafka adds operational overhead (ZooKeeper/KRaft, broker management, consumer group coordination) that isn't justified. Redis already exists in the stack for caching and idempotency. Using it for queuing avoids adding a new infrastructure component. Redis lists give FIFO semantics, blocking pop, and sufficient throughput for this scale.</p>
+<p><strong>Tradeoff:</strong> Redis lists lack Kafka's replay capability, offset management, and fan-out to multiple consumer groups. If we needed to replay AI decisions or have multiple independent consumers of the same event, we'd pay for Kafka. At current scale, YAGNI — we don't need it.</p>
+</div>
+
+<h4>Why async processing for AI?</h4>
+<div class="card">
+<p><strong>Why:</strong> AI inference takes 2–15 seconds. Blocking the HTTP request thread for that duration would exhaust the FastAPI worker pool under any meaningful load. By returning <code>202 PROCESSING</code> immediately, we decouple the user-facing response latency from the AI processing latency. The user gets a fast response, the system stays available, and the AI decision arrives asynchronously.</p>
+<p><strong>Tradeoff:</strong> Polling complexity on the frontend. We mitigate with WebSockets as a future option — but polling every 3s is simple and sufficient for a leave approval system where decisions aren't time-critical to the second.</p>
+</div>
+
+<h4>Why stateless backend?</h4>
+<div class="card">
+<p><strong>Why:</strong> Stateless FastAPI instances share no in-process state — no session data, no in-memory caches specific to one instance. All shared state lives in Redis and PostgreSQL. This means any instance can handle any request, NGINX can route freely, and we can add/remove instances without sticky sessions or coordination. Horizontal scaling becomes trivially addable.</p>
+<p><strong>Tradeoff:</strong> Every request pays a Redis round-trip for auth token validation and cache reads. This is ~0.5–2ms and well within budget. The scalability benefit far outweighs this cost.</p>
+</div>
+
+<h4>DB vs cache tradeoffs</h4>
+<div class="card">
+<p><strong>DB is the source of truth, always.</strong> We write to DB before updating cache. If Redis fails, the system degrades gracefully — every request falls through to DB. Slightly higher latency, but no data loss and no stale decisions.</p>
+<p><strong>Cache serves reads.</strong> Status polling (the most frequent read) hits Redis first. Cache miss ratio should be &lt;30%. If it's higher, TTLs are too short or cache is being evicted due to memory pressure.</p>
+<p><strong>Never cache mutable data without invalidation.</strong> Leave status changes frequently during processing. We delete-then-repopulate on every state change rather than relying on TTL expiry — a 60s stale status is acceptable for the frontend, but we don't want an admin to see wrong data after their own override action.</p>
+</div>
+
+<h4>Rule engine vs AI: why two layers?</h4>
+<div class="card">
+<p>The rule engine handles the 80% of cases that are deterministic: trivially short leaves, clearly invalid requests, balance exhaustion. These get decisions in &lt;50ms at near-zero cost. The AI handles the nuanced 20%: complex reasons, edge cases, conflicting signals. Sending all requests to AI would add 2–15s latency and cost to every request unnecessarily. This hybrid approach keeps p95 latency low while preserving flexibility for complex cases.</p>
+</div>
+</div>
+
+<script>
+function show(id) {
+  document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('pane-' + id).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
