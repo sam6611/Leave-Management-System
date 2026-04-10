@@ -11,4 +11,5 @@ class Settings(BaseSettings):
     jwt_exp_minutes: int = 60
 
 
+
 settings = Settings()
