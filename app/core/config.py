@@ -10,6 +10,6 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_exp_minutes: int = 60
 
-
+# fj
 
 settings = Settings()
