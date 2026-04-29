@@ -1,5 +1,6 @@
 # Leave Management System (SLMS)
 
+
 ## 📌 Overview
 
 A scalable backend system for managing employee leave requests, approvals, and tracking.
